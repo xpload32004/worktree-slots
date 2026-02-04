@@ -55,6 +55,17 @@ worktree-slots free 1
 
 No more thinking about directory names or paths. Just "slot 1", "slot 2", etc.
 
+## Features
+
+- **Numbered slots** - Up to N worktrees per project (default: 5), no naming required
+- **Quick status** - See all slots, branches, and uncommitted changes at a glance
+- **Smart branch handling** - Creates new branches if they don't exist, tracks remotes automatically
+- **Configurable `open` command** - Launch your editor/terminal/tmux setup with one command
+- **Auto-copies dotfiles** - Untracked files (`.envrc`, `.claude/`, etc.) copied to new slots
+- **Safe cleanup** - Warns about uncommitted changes before removing slots
+- **XDG-compliant config** - Settings in `~/.config/worktree-slots/config`
+- **Zero dependencies** - Just bash and git
+
 ## Installation
 
 ### One-liner (recommended)
@@ -84,9 +95,12 @@ cd worktree-slots
 ## Quick Start
 
 ```bash
-# 1. Set up your repos directory (optional, default: ~/repos)
+# 1. Set up your config (optional)
 mkdir -p ~/.config/worktree-slots
-echo 'REPOS_DIR="$HOME/projects"' > ~/.config/worktree-slots/config
+cat > ~/.config/worktree-slots/config << 'EOF'
+REPOS_DIR="$HOME/projects"
+OPEN_EDITOR="code"  # or nvim, vim, etc.
+EOF
 
 # 2. From inside any git repo
 cd ~/projects/myproject
@@ -94,11 +108,11 @@ worktree-slots status          # See all slots
 
 # 3. Start working on a feature
 worktree-slots use 1 feature/new-dashboard
-cd ~/projects/myproject-slot-1  # Your worktree is ready
+worktree-slots open 1          # Opens in your configured editor
 
 # 4. Need to review a PR? Use another slot
 worktree-slots use 2 fix/login-bug
-cd ~/projects/myproject-slot-2
+worktree-slots open 2          # Opens in a separate editor window
 
 # 5. Done with a branch? Clean up
 worktree-slots free 1
