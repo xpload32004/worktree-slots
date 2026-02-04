@@ -1,0 +1,724 @@
+#!/bin/bash
+#
+# worktree-slots - Manage git worktree slots for parallel development
+#
+# Usage: worktree-slots <command> [args]
+#
+# Commands:
+#   list              Show all slots and their current branch/status
+#   use <slot> <branch>  Create/switch a slot to a branch
+#   free <slot>       Clean up a slot (remove worktree)
+#   status            Quick overview of what's where
+#   init <project>    Initialize slots for a project
+#   open <slot>       Open slot in configured terminal/editor
+#   config            Show current configuration
+#   help              Show this help message
+
+set -e
+
+# XDG Base Directory Specification
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONFIG_DIR="$XDG_CONFIG_HOME/worktree-slots"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+# Default configuration
+REPOS_DIR="${WORKTREE_REPOS_DIR:-$HOME/repos}"
+NUM_SLOTS="${WORKTREE_NUM_SLOTS:-5}"
+
+# Open command configuration (customize in config file)
+# These define what happens when you run 'worktree-slots open <slot>'
+OPEN_TERMINAL=""           # Terminal app (e.g., "Ghostty", "iTerm", "Terminal")
+OPEN_USE_TMUX=false        # Whether to use tmux
+OPEN_TMUX_LAYOUT=""        # Custom tmux commands (runs in slot directory)
+OPEN_EDITOR=""             # Editor to open (e.g., "nvim", "code", "vim")
+OPEN_COMMAND=""            # Full custom command (overrides all above)
+
+# Load user config if it exists
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Helper functions
+error() {
+    echo -e "${RED}Error:${NC} $1" >&2
+    exit 1
+}
+
+warn() {
+    echo -e "${YELLOW}Warning:${NC} $1" >&2
+}
+
+info() {
+    echo -e "${CYAN}$1${NC}"
+}
+
+success() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+# Copy untracked hidden files from main repo to slot
+copy_untracked_dotfiles() {
+    local src="$1"
+    local dest="$2"
+    local copied=0
+
+    # Find hidden files/dirs in root that are not tracked by git
+    for item in "$src"/.*; do
+        local basename=$(basename "$item")
+
+        # Skip . and .. and .git
+        [[ "$basename" == "." || "$basename" == ".." || "$basename" == ".git" ]] && continue
+
+        # Check if this file/dir is tracked by git
+        if git -C "$src" ls-files --error-unmatch "$basename" &>/dev/null; then
+            # File is tracked, skip it
+            continue
+        fi
+
+        # Check if it's in .gitignore or otherwise ignored
+        if git -C "$src" check-ignore -q "$basename" 2>/dev/null || \
+           ! git -C "$src" ls-files --others --exclude-standard "$basename" &>/dev/null | grep -q .; then
+            # Copy untracked/ignored files
+            if [[ -f "$item" ]]; then
+                cp "$item" "$dest/"
+                ((copied++))
+            elif [[ -d "$item" ]]; then
+                cp -r "$item" "$dest/"
+                ((copied++))
+            fi
+        fi
+    done
+
+    if [[ $copied -gt 0 ]]; then
+        info "Copied $copied untracked dotfile(s) from main repo"
+    fi
+}
+
+# Detect project name from current directory or argument
+detect_project() {
+    local dir="$1"
+
+    if [[ -z "$dir" ]]; then
+        dir="$(pwd)"
+    fi
+
+    # If we're in a slot directory, extract the project name
+    local basename=$(basename "$dir")
+    if [[ "$basename" =~ ^(.+)-slot-[0-9]+$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    # If we're in a git repo, use its name
+    if [[ -d "$dir/.git" ]] || git -C "$dir" rev-parse --git-dir &>/dev/null; then
+        # Get the root of the git repo
+        local git_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)
+        if [[ -n "$git_root" ]]; then
+            basename "$git_root" | sed 's/-slot-[0-9]*$//'
+            return 0
+        fi
+    fi
+
+    # Check if we're in the repos base directory
+    local real_dir=$(cd "$dir" && pwd -P)
+    local real_repos=$(cd "$REPOS_DIR" 2>/dev/null && pwd -P)
+    if [[ "$real_dir" == "$real_repos" ]]; then
+        # In repos base dir, no project detected
+        return 0
+    fi
+
+    # Fall back to current directory name (might be a project dir without .git)
+    # But verify it looks like a valid project (exists as a repo)
+    local potential_project="$basename"
+    if [[ -d "$REPOS_DIR/$potential_project/.git" ]]; then
+        echo "$potential_project"
+        return 0
+    fi
+
+    # No valid project found - return empty (caller checks for this)
+    return 0
+}
+
+# Get the main repo directory for a project
+get_main_repo() {
+    local project="$1"
+    echo "$REPOS_DIR/$project"
+}
+
+# Get slot directory
+get_slot_dir() {
+    local project="$1"
+    local slot="$2"
+    echo "$REPOS_DIR/${project}-slot-${slot}"
+}
+
+# Validate slot number
+validate_slot() {
+    local slot="$1"
+    if ! [[ "$slot" =~ ^[0-9]+$ ]] || [[ "$slot" -lt 1 ]] || [[ "$slot" -gt "$NUM_SLOTS" ]]; then
+        error "Slot must be a number between 1 and $NUM_SLOTS"
+    fi
+}
+
+# Check if a directory has uncommitted changes
+has_uncommitted_changes() {
+    local dir="$1"
+    if [[ -d "$dir" ]] && git -C "$dir" rev-parse --git-dir &>/dev/null; then
+        ! git -C "$dir" diff --quiet HEAD 2>/dev/null || \
+        ! git -C "$dir" diff --cached --quiet 2>/dev/null || \
+        [[ -n $(git -C "$dir" ls-files --others --exclude-standard 2>/dev/null) ]]
+    else
+        return 1
+    fi
+}
+
+# Get current branch of a directory
+get_current_branch() {
+    local dir="$1"
+    if [[ -d "$dir" ]] && git -C "$dir" rev-parse --git-dir &>/dev/null; then
+        git -C "$dir" branch --show-current 2>/dev/null || echo "(detached)"
+    else
+        echo "-"
+    fi
+}
+
+# Get short status of a directory
+get_short_status() {
+    local dir="$1"
+    if [[ ! -d "$dir" ]]; then
+        echo -e "${BLUE}empty${NC}"
+        return
+    fi
+
+    if ! git -C "$dir" rev-parse --git-dir &>/dev/null; then
+        echo -e "${YELLOW}not a repo${NC}"
+        return
+    fi
+
+    local status=""
+
+    # Check for uncommitted changes
+    if has_uncommitted_changes "$dir"; then
+        status="${YELLOW}modified${NC}"
+    else
+        status="${GREEN}clean${NC}"
+    fi
+
+    # Check if ahead/behind remote
+    local upstream=$(git -C "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)
+    if [[ -n "$upstream" ]]; then
+        local ahead=$(git -C "$dir" rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo 0)
+        local behind=$(git -C "$dir" rev-list --count 'HEAD..@{upstream}' 2>/dev/null || echo 0)
+        if [[ "$ahead" -gt 0 ]]; then
+            status="$status ${GREEN}↑$ahead${NC}"
+        fi
+        if [[ "$behind" -gt 0 ]]; then
+            status="$status ${RED}↓$behind${NC}"
+        fi
+    fi
+
+    echo -e "$status"
+}
+
+# Command: list
+cmd_list() {
+    local project="$1"
+
+    if [[ -z "$project" ]]; then
+        project=$(detect_project)
+    fi
+
+    if [[ -z "$project" ]]; then
+        error "Not in a project directory. Run from inside a repo or slot, or use: worktree-slots list <project>"
+    fi
+
+    local main_repo=$(get_main_repo "$project")
+
+    if [[ ! -d "$main_repo/.git" ]]; then
+        error "Main repo not found at $main_repo"
+    fi
+
+    echo -e "${BOLD}Project:${NC} $project"
+    echo -e "${BOLD}Main repo:${NC} $main_repo"
+    echo ""
+
+    printf "%-8s %-30s %-20s %s\n" "SLOT" "BRANCH" "STATUS" "PATH"
+    printf "%-8s %-30s %-20s %s\n" "----" "------" "------" "----"
+
+    for slot in $(seq 1 $NUM_SLOTS); do
+        local slot_dir=$(get_slot_dir "$project" "$slot")
+        local branch=$(get_current_branch "$slot_dir")
+        local status=$(get_short_status "$slot_dir")
+        local path_display
+
+        if [[ -d "$slot_dir" ]]; then
+            path_display="$slot_dir"
+        else
+            path_display="-"
+        fi
+
+        printf "%-8s %-30s " "slot-$slot" "$branch"
+        echo -e "$status"
+    done
+}
+
+# Command: status (compact version)
+cmd_status() {
+    local project="$1"
+
+    if [[ -z "$project" ]]; then
+        project=$(detect_project)
+    fi
+
+    if [[ -z "$project" ]]; then
+        error "Not in a project directory. Run from inside a repo or slot, or use: worktree-slots status <project>"
+    fi
+
+    local main_repo=$(get_main_repo "$project")
+
+    if [[ ! -d "$main_repo/.git" ]]; then
+        error "Main repo not found at $main_repo"
+    fi
+
+    echo -e "${BOLD}$project${NC} slots:"
+
+    for slot in $(seq 1 $NUM_SLOTS); do
+        local slot_dir=$(get_slot_dir "$project" "$slot")
+        local branch=$(get_current_branch "$slot_dir")
+
+        if [[ "$branch" == "-" ]]; then
+            echo -e "  ${BLUE}$slot${NC}: (empty)"
+        else
+            local status_icon=""
+            if has_uncommitted_changes "$slot_dir"; then
+                status_icon=" ${YELLOW}*${NC}"
+            fi
+            echo -e "  ${GREEN}$slot${NC}: $branch$status_icon"
+        fi
+    done
+}
+
+# Command: use
+cmd_use() {
+    local slot="$1"
+    local branch="$2"
+
+    if [[ -z "$slot" ]] || [[ -z "$branch" ]]; then
+        error "Usage: worktree-slots use <slot> <branch>"
+    fi
+
+    validate_slot "$slot"
+
+    local project=$(detect_project)
+
+    if [[ -z "$project" ]]; then
+        error "Not in a project directory. Run from inside a repo or slot."
+    fi
+
+    local main_repo=$(get_main_repo "$project")
+    local slot_dir=$(get_slot_dir "$project" "$slot")
+
+    if [[ ! -d "$main_repo/.git" ]]; then
+        error "Main repo not found at $main_repo"
+    fi
+
+    # Check if slot already exists
+    if [[ -d "$slot_dir" ]]; then
+        local current_branch=$(get_current_branch "$slot_dir")
+
+        if [[ "$current_branch" == "$branch" ]]; then
+            info "Slot $slot is already on branch '$branch'"
+            return 0
+        fi
+
+        # Check for uncommitted changes
+        if has_uncommitted_changes "$slot_dir"; then
+            error "Slot $slot has uncommitted changes. Commit or stash them first, or use 'free' with --force"
+        fi
+
+        # Switch the existing worktree to the new branch
+        info "Switching slot $slot from '$current_branch' to '$branch'..."
+
+        # Check if branch exists locally or remotely
+        if git -C "$main_repo" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+            # Branch exists locally
+            git -C "$slot_dir" checkout "$branch"
+        elif git -C "$main_repo" show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
+            # Branch exists on remote
+            git -C "$slot_dir" checkout -b "$branch" "origin/$branch"
+        else
+            # Create new branch from current HEAD
+            warn "Branch '$branch' doesn't exist. Creating from current HEAD..."
+            git -C "$slot_dir" checkout -b "$branch"
+        fi
+
+        success "Slot $slot now on branch '$branch'"
+    else
+        # Create new worktree
+        info "Creating slot $slot with branch '$branch'..."
+
+        # Fetch latest to ensure we have remote branches
+        git -C "$main_repo" fetch --quiet origin 2>/dev/null || true
+
+        # Check if branch exists locally or remotely
+        if git -C "$main_repo" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+            # Branch exists locally - create worktree from it
+            git -C "$main_repo" worktree add "$slot_dir" "$branch"
+        elif git -C "$main_repo" show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
+            # Branch exists on remote - create worktree tracking it
+            git -C "$main_repo" worktree add "$slot_dir" -b "$branch" "origin/$branch"
+        else
+            # Create new branch from main/master
+            local default_branch=$(git -C "$main_repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|origin/||' || echo "main")
+            info "Branch '$branch' doesn't exist. Creating from '$default_branch'..."
+            git -C "$main_repo" worktree add "$slot_dir" -b "$branch" --no-track "origin/$default_branch"
+        fi
+
+        # Copy untracked dotfiles from main repo
+        copy_untracked_dotfiles "$main_repo" "$slot_dir"
+
+        success "Created slot $slot at $slot_dir"
+    fi
+
+    echo ""
+    echo "To start working:"
+    echo -e "  ${CYAN}cd $slot_dir${NC}"
+}
+
+# Command: free
+cmd_free() {
+    local slot=""
+    local force=false
+
+    # Parse flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f)
+                force=true
+                shift
+                ;;
+            *)
+                if [[ -z "$slot" ]] || [[ "$slot" == --* ]]; then
+                    slot="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$slot" ]]; then
+        error "Usage: worktree-slots free <slot> [--force]"
+    fi
+
+    validate_slot "$slot"
+
+    local project=$(detect_project)
+
+    if [[ -z "$project" ]]; then
+        error "Not in a project directory. Run from inside a repo or slot."
+    fi
+
+    local main_repo=$(get_main_repo "$project")
+    local slot_dir=$(get_slot_dir "$project" "$slot")
+
+    if [[ ! -d "$slot_dir" ]]; then
+        info "Slot $slot is already empty"
+        return 0
+    fi
+
+    local branch=$(get_current_branch "$slot_dir")
+
+    # Check for uncommitted changes
+    if has_uncommitted_changes "$slot_dir"; then
+        if [[ "$force" != true ]]; then
+            error "Slot $slot has uncommitted changes. Use --force to remove anyway"
+        fi
+        warn "Discarding uncommitted changes in slot $slot..."
+    fi
+
+    info "Removing slot $slot (branch: $branch)..."
+
+    # Remove the worktree
+    git -C "$main_repo" worktree remove "$slot_dir" --force 2>/dev/null || \
+        rm -rf "$slot_dir"
+
+    # Prune worktree list
+    git -C "$main_repo" worktree prune 2>/dev/null || true
+
+    success "Freed slot $slot"
+}
+
+# Command: init
+cmd_init() {
+    local project="$1"
+
+    if [[ -z "$project" ]]; then
+        project=$(detect_project)
+    fi
+
+    local main_repo=$(get_main_repo "$project")
+
+    if [[ ! -d "$main_repo/.git" ]]; then
+        error "Main repo not found at $main_repo. Clone it first."
+    fi
+
+    info "Initializing worktree slots for project: $project"
+    echo "Main repo: $main_repo"
+    echo ""
+
+    # Ensure we're on the default branch in main repo
+    local default_branch=$(git -C "$main_repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|origin/||' || echo "main")
+    local current_branch=$(get_current_branch "$main_repo")
+
+    if [[ "$current_branch" != "$default_branch" ]]; then
+        info "Switching main repo to $default_branch..."
+        git -C "$main_repo" checkout "$default_branch" 2>/dev/null || \
+            git -C "$main_repo" checkout -b "$default_branch" "origin/$default_branch"
+    fi
+
+    echo "Slot directories will be created at:"
+    for slot in $(seq 1 $NUM_SLOTS); do
+        echo "  $(get_slot_dir "$project" "$slot")"
+    done
+
+    success "Initialization complete. Use 'worktree-slots use <slot> <branch>' to set up a slot."
+}
+
+# Command: open
+cmd_open() {
+    local slot="$1"
+
+    if [[ -z "$slot" ]]; then
+        error "Usage: worktree-slots open <slot>"
+    fi
+
+    validate_slot "$slot"
+
+    local project=$(detect_project)
+
+    if [[ -z "$project" ]]; then
+        error "Not in a project directory. Run from inside a repo or slot."
+    fi
+
+    local slot_dir=$(get_slot_dir "$project" "$slot")
+
+    if [[ ! -d "$slot_dir" ]]; then
+        error "Slot $slot is empty. Use 'worktree-slots use $slot <branch>' first."
+    fi
+
+    local branch=$(get_current_branch "$slot_dir")
+
+    # Check if open is configured
+    if [[ -z "$OPEN_COMMAND" ]] && [[ -z "$OPEN_EDITOR" ]] && [[ -z "$OPEN_TERMINAL" ]]; then
+        echo -e "${YELLOW}The 'open' command is not configured.${NC}"
+        echo ""
+        echo "Add configuration to $CONFIG_FILE:"
+        echo ""
+        echo "  # Option 1: Simple - just open an editor"
+        echo "  OPEN_EDITOR=\"code\"  # or nvim, vim, etc."
+        echo ""
+        echo "  # Option 2: Terminal + editor"
+        echo "  OPEN_TERMINAL=\"iTerm\""
+        echo "  OPEN_EDITOR=\"nvim\""
+        echo ""
+        echo "  # Option 3: Full custom command"
+        echo "  # Variables available: \$slot_dir, \$branch, \$project, \$slot"
+        echo "  OPEN_COMMAND='cd \$slot_dir && code .'"
+        echo ""
+        echo "For now, you can manually:"
+        echo -e "  ${CYAN}cd $slot_dir${NC}"
+        return 1
+    fi
+
+    info "Opening slot $slot ($branch)..."
+
+    # If custom command is set, use it
+    if [[ -n "$OPEN_COMMAND" ]]; then
+        eval "$OPEN_COMMAND"
+        return $?
+    fi
+
+    # Build command based on configuration
+    if [[ -n "$OPEN_TERMINAL" ]]; then
+        case "$OPEN_TERMINAL" in
+            Ghostty|ghostty)
+                if [[ "$OPEN_USE_TMUX" == true ]] && [[ -n "$OPEN_TMUX_LAYOUT" ]]; then
+                    local session_name="${project}-slot-${slot}"
+                    tmux kill-session -t "$session_name" 2>/dev/null || true
+                    eval "cd \"$slot_dir\" && $OPEN_TMUX_LAYOUT"
+                    open -na Ghostty --args --title="$branch" -e tmux attach -t "$session_name"
+                elif [[ -n "$OPEN_EDITOR" ]]; then
+                    open -na Ghostty --args --title="$branch" --working-directory="$slot_dir" -e "$OPEN_EDITOR" .
+                else
+                    open -na Ghostty --args --title="$branch" --working-directory="$slot_dir"
+                fi
+                ;;
+            iTerm|iterm)
+                osascript -e "tell application \"iTerm\"
+                    create window with default profile
+                    tell current session of current window
+                        write text \"cd '$slot_dir' && ${OPEN_EDITOR:+$OPEN_EDITOR .}\"
+                    end tell
+                end tell"
+                ;;
+            Terminal|terminal)
+                open -a Terminal "$slot_dir"
+                if [[ -n "$OPEN_EDITOR" ]]; then
+                    # Terminal doesn't support running commands easily, just cd
+                    echo "Run: $OPEN_EDITOR ."
+                fi
+                ;;
+            *)
+                warn "Unknown terminal: $OPEN_TERMINAL. Opening with default."
+                if [[ -n "$OPEN_EDITOR" ]]; then
+                    (cd "$slot_dir" && $OPEN_EDITOR .)
+                fi
+                ;;
+        esac
+    elif [[ -n "$OPEN_EDITOR" ]]; then
+        # No terminal specified, just open editor
+        (cd "$slot_dir" && $OPEN_EDITOR .)
+    fi
+
+    success "Opened slot $slot"
+}
+
+# Command: config
+cmd_config() {
+    echo -e "${BOLD}worktree-slots configuration${NC}"
+    echo ""
+    echo -e "${CYAN}Config file:${NC} $CONFIG_FILE"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo -e "${GREEN}(exists)${NC}"
+    else
+        echo -e "${YELLOW}(not found - using defaults)${NC}"
+    fi
+    echo ""
+    echo -e "${BOLD}Current settings:${NC}"
+    echo "  REPOS_DIR=$REPOS_DIR"
+    echo "  NUM_SLOTS=$NUM_SLOTS"
+    echo ""
+    echo -e "${BOLD}Open command settings:${NC}"
+    echo "  OPEN_TERMINAL=${OPEN_TERMINAL:-(not set)}"
+    echo "  OPEN_EDITOR=${OPEN_EDITOR:-(not set)}"
+    echo "  OPEN_USE_TMUX=$OPEN_USE_TMUX"
+    echo "  OPEN_COMMAND=${OPEN_COMMAND:-(not set)}"
+    echo ""
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "To create a config file, run:"
+        echo -e "  ${CYAN}mkdir -p $CONFIG_DIR && cat > $CONFIG_FILE << 'EOF'"
+        echo "REPOS_DIR=\"\$HOME/repos\""
+        echo "NUM_SLOTS=5"
+        echo "OPEN_EDITOR=\"code\""
+        echo "EOF${NC}"
+    fi
+}
+
+# Command: help
+cmd_help() {
+    cat << 'EOF'
+worktree-slots - Manage git worktree slots for parallel development
+
+USAGE:
+    worktree-slots <command> [arguments]
+
+COMMANDS:
+    list [project]    Show all slots and their current branch/status
+    status [project]  Quick compact overview of slots
+    use <slot> <branch>
+                      Create or switch a slot to a branch
+                      - Creates worktree if slot is empty
+                      - Switches branch if slot exists
+                      - Creates new branch if it doesn't exist
+    free <slot>       Remove a worktree slot
+                      --force, -f    Force removal even with uncommitted changes
+    open <slot>       Open slot in configured terminal/editor
+    init [project]    Initialize slots for a project (shows setup info)
+    config            Show current configuration
+    help              Show this help message
+
+CONFIGURATION:
+    Config file: ~/.config/worktree-slots/config
+
+    # Example config:
+    REPOS_DIR="$HOME/repos"       # Where your repos live
+    NUM_SLOTS=5                   # Number of slots (1-N)
+    OPEN_EDITOR="code"            # Editor for 'open' command
+    OPEN_TERMINAL="iTerm"         # Terminal app (optional)
+
+ENVIRONMENT:
+    WORKTREE_REPOS_DIR   Override REPOS_DIR
+    WORKTREE_NUM_SLOTS   Override NUM_SLOTS
+
+EXAMPLES:
+    # See what's in each slot
+    worktree-slots status
+
+    # Start working on a new feature
+    worktree-slots use 1 feature/new-login
+    cd ~/repos/myproject-slot-1
+
+    # Switch to review an MR
+    worktree-slots use 2 fix/bug-123
+
+    # Clean up after MR is merged
+    worktree-slots free 1
+
+    # Open a slot in your editor
+    worktree-slots open 1
+
+WORKFLOW:
+    1. Keep the main repo on main/master for pulls
+    2. Use slots 1-N for different branches/MRs
+    3. Each slot is an independent worktree
+    4. When done, free the slot for reuse
+EOF
+}
+
+# Main entry point
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    case "$command" in
+        list)
+            cmd_list "$@"
+            ;;
+        status|st)
+            cmd_status "$@"
+            ;;
+        use)
+            cmd_use "$@"
+            ;;
+        free|rm|remove)
+            cmd_free "$@"
+            ;;
+        open)
+            cmd_open "$@"
+            ;;
+        init)
+            cmd_init "$@"
+            ;;
+        config|cfg)
+            cmd_config "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        *)
+            error "Unknown command: $command. Use 'worktree-slots help' for usage."
+            ;;
+    esac
+}
+
+main "$@"
