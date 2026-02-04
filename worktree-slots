@@ -72,12 +72,22 @@ copy_untracked_dotfiles() {
     local dest="$2"
     local copied=0
 
+    # Directories that should NOT be copied (recreate per-worktree instead)
+    local skip_dirs=(".venv" ".tox" ".pytest_cache" ".mypy_cache" ".ruff_cache" ".coverage" ".nox" ".eggs" ".cache")
+
     # Find hidden files/dirs in root that are not tracked by git
     for item in "$src"/.*; do
         local basename=$(basename "$item")
 
         # Skip . and .. and .git
         [[ "$basename" == "." || "$basename" == ".." || "$basename" == ".git" ]] && continue
+
+        # Skip directories that shouldn't be copied
+        for skip in "${skip_dirs[@]}"; do
+            if [[ "$basename" == "$skip" ]]; then
+                continue 2
+            fi
+        done
 
         # Check if this file/dir is tracked by git
         if git -C "$src" ls-files --error-unmatch "$basename" &>/dev/null; then
@@ -90,10 +100,10 @@ copy_untracked_dotfiles() {
            ! git -C "$src" ls-files --others --exclude-standard "$basename" &>/dev/null | grep -q .; then
             # Copy untracked/ignored files
             if [[ -f "$item" ]]; then
-                cp "$item" "$dest/"
+                cp "$item" "$dest/" 2>/dev/null || true
                 ((copied++))
             elif [[ -d "$item" ]]; then
-                cp -r "$item" "$dest/"
+                cp -r "$item" "$dest/" 2>/dev/null || true
                 ((copied++))
             fi
         fi
