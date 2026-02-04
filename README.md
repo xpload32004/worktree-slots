@@ -1,16 +1,59 @@
 # worktree-slots
 
-Manage git worktree slots for parallel development. Work on multiple branches simultaneously without stashing or switching—each slot is an independent worktree.
+A simple CLI to manage git worktrees as numbered "slots" for parallel development.
 
-## Why?
+## The Problem
 
-When working on multiple features or reviewing MRs, constantly switching branches is painful:
+Git worktrees are powerful—they let you have multiple branches checked out simultaneously in separate directories. But managing them manually is tedious:
+
+```bash
+# Without worktree-slots: manual worktree management
+git worktree add ../myproject-feature-login feature/login
+git worktree add ../myproject-fix-auth-bug fix/auth-bug
+git worktree add ../myproject-review-api-refactor review/api-refactor
+
+# Where was that branch again?
+ls ../myproject-*
+# Which one has uncommitted changes?
+# Which one can I delete?
+```
+
+You end up with inconsistent naming, scattered directories, and mental overhead tracking what's where. And when you're juggling multiple features, bug fixes, and code reviews, this friction adds up.
+
+**The alternative—branch switching—is worse:**
 - Stash changes, switch, unstash, repeat
 - IDE reindexes everything on each switch
 - Build caches invalidated
+- Tests need to rerun
 - Context switching overhead
 
-**worktree-slots** gives you numbered "slots" that are independent worktrees of the same repo. Switch between branches instantly by just changing directories.
+## The Solution
+
+**worktree-slots** gives you numbered slots (1-5 by default) that handle all the worktree plumbing:
+
+```bash
+# With worktree-slots: simple numbered slots
+worktree-slots use 1 feature/login
+worktree-slots use 2 fix/auth-bug
+worktree-slots use 3 review/api-refactor
+
+# See what's where
+worktree-slots status
+# myproject slots:
+#   1: feature/login
+#   2: fix/auth-bug *        (* = uncommitted changes)
+#   3: review/api-refactor
+#   4: (empty)
+#   5: (empty)
+
+# Switch slot 3 to a different branch
+worktree-slots use 3 hotfix/urgent
+
+# Done with a branch? Free up the slot
+worktree-slots free 1
+```
+
+No more thinking about directory names or paths. Just "slot 1", "slot 2", etc.
 
 ## Installation
 
@@ -23,12 +66,11 @@ curl -fsSL https://raw.githubusercontent.com/xpload32004/worktree-slots/main/ins
 ### Manual
 
 ```bash
-# Download
 curl -o ~/.local/bin/worktree-slots https://raw.githubusercontent.com/xpload32004/worktree-slots/main/worktree-slots
 chmod +x ~/.local/bin/worktree-slots
 
 # Ensure ~/.local/bin is in your PATH
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc  # or ~/.zshrc
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc
 ```
 
 ### From source
@@ -42,55 +84,66 @@ cd worktree-slots
 ## Quick Start
 
 ```bash
-# 1. Configure where your repos live (optional, default: ~/repos)
+# 1. Set up your repos directory (optional, default: ~/repos)
 mkdir -p ~/.config/worktree-slots
-echo 'REPOS_DIR="$HOME/repos"' > ~/.config/worktree-slots/config
+echo 'REPOS_DIR="$HOME/projects"' > ~/.config/worktree-slots/config
 
-# 2. Clone a repo to your repos directory
-cd ~/repos
-git clone git@github.com:user/myproject.git
-cd myproject
+# 2. From inside any git repo
+cd ~/projects/myproject
+worktree-slots status          # See all slots
 
-# 3. See available slots
-worktree-slots status
+# 3. Start working on a feature
+worktree-slots use 1 feature/new-dashboard
+cd ~/projects/myproject-slot-1  # Your worktree is ready
 
-# 4. Start working on a feature
-worktree-slots use 1 feature/new-login
-cd ~/repos/myproject-slot-1
+# 4. Need to review a PR? Use another slot
+worktree-slots use 2 fix/login-bug
+cd ~/projects/myproject-slot-2
 
-# 5. Work on another branch in parallel
-worktree-slots use 2 fix/bug-123
-cd ~/repos/myproject-slot-2
-
-# 6. When done, free up slots
+# 5. Done with a branch? Clean up
 worktree-slots free 1
 ```
+
+## How It Works
+
+Given a repo at `~/repos/myproject`, worktree-slots creates:
+
+```
+~/repos/
+├── myproject/           # Main repo (keep on main/master for pulling)
+├── myproject-slot-1/    # Worktree for slot 1
+├── myproject-slot-2/    # Worktree for slot 2
+├── myproject-slot-3/    # Worktree for slot 3
+├── myproject-slot-4/    # Worktree for slot 4
+└── myproject-slot-5/    # Worktree for slot 5
+```
+
+Each slot is a full git worktree—independent working directory, same repo. Changes in one slot don't affect others. Commits are shared (same `.git`).
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `status [project]` | Quick overview of all slots |
-| `list [project]` | Detailed slot information |
+| `list [project]` | Detailed slot info (branch, status, path) |
 | `use <slot> <branch>` | Create or switch a slot to a branch |
-| `free <slot>` | Remove a worktree slot |
+| `free <slot>` | Remove a worktree slot (`--force` to discard changes) |
 | `open <slot>` | Open slot in configured editor/terminal |
-| `init [project]` | Initialize slots for a project |
 | `config` | Show current configuration |
 | `help` | Show help message |
 
 ## Configuration
 
-Configuration file: `~/.config/worktree-slots/config`
+Config file: `~/.config/worktree-slots/config`
 
 ```bash
 # Where your git repos live
 REPOS_DIR="$HOME/repos"
 
-# Number of slots available (default: 5)
+# Number of slots (default: 5)
 NUM_SLOTS=5
 
-# For 'worktree-slots open' command:
+# Configure 'worktree-slots open <slot>' behavior:
 
 # Option 1: Just an editor
 OPEN_EDITOR="code"  # or nvim, vim, etc.
@@ -99,47 +152,60 @@ OPEN_EDITOR="code"  # or nvim, vim, etc.
 OPEN_TERMINAL="iTerm"  # or Ghostty, Terminal
 OPEN_EDITOR="nvim"
 
-# Option 3: Full custom command
-# Variables: $slot_dir, $branch, $project, $slot
+# Option 3: Full custom command (variables: $slot_dir, $branch, $project, $slot)
 OPEN_COMMAND='cd $slot_dir && code .'
 ```
 
 ### Environment Variables
 
-These override config file settings:
+Override config settings:
 
 - `WORKTREE_REPOS_DIR` - Override `REPOS_DIR`
 - `WORKTREE_NUM_SLOTS` - Override `NUM_SLOTS`
 
-## Directory Structure
-
-Given `REPOS_DIR=~/repos` and a project called `myproject`:
-
-```
-~/repos/
-├── myproject/           # Main repo (keep on main/master)
-├── myproject-slot-1/    # Worktree for slot 1
-├── myproject-slot-2/    # Worktree for slot 2
-├── myproject-slot-3/    # Worktree for slot 3
-└── ...
-```
-
 ## Workflow Tips
 
-1. **Keep main repo clean**: The main repo (`~/repos/myproject`) should stay on main/master for pulling updates.
+1. **Keep main repo on main/master** - Use it for `git pull` to fetch updates, not for development.
 
-2. **One branch per slot**: Each slot checks out a single branch. Use different slots for different features/MRs.
+2. **One branch per slot** - Each slot is one worktree. Context switch by changing directories, not branches.
 
-3. **Parallel development**: Run different IDE windows or terminal sessions per slot.
+3. **Run separate IDE/terminal per slot** - VS Code, nvim, etc. each pointing at a different slot directory.
 
-4. **Dotfile copying**: When creating a new slot, untracked dotfiles (like `.envrc`) are automatically copied from the main repo.
+4. **Dotfiles are copied automatically** - Untracked files like `.envrc` are copied from the main repo when creating a new slot.
 
-5. **Safe cleanup**: `worktree-slots free` checks for uncommitted changes before removing. Use `--force` to override.
+5. **Safe cleanup** - `worktree-slots free` warns about uncommitted changes. Use `--force` to discard.
+
+## Example: Parallel Development Workflow
+
+```bash
+# Morning: Start feature work
+cd ~/repos/backend
+worktree-slots use 1 feature/user-preferences
+cd ~/repos/backend-slot-1
+code .  # Open VS Code
+
+# Teammate asks for PR review
+worktree-slots use 2 teammate/api-refactor
+cd ~/repos/backend-slot-2
+code .  # Another VS Code window
+
+# Urgent bug reported
+worktree-slots use 3 hotfix/login-crash
+cd ~/repos/backend-slot-3
+# Fix, commit, push, PR merged
+
+# Clean up hotfix slot
+worktree-slots free 3
+
+# Back to feature work - nothing changed in slot 1
+cd ~/repos/backend-slot-1
+```
 
 ## Requirements
 
-- Git 2.5+ (for worktree support)
+- Git 2.5+ (worktree support)
 - Bash 4.0+
+- macOS or Linux
 
 ## License
 
