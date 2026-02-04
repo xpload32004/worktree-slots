@@ -65,7 +65,7 @@ No more thinking about directory names or paths. Just "slot 1", "slot 2", etc.
 - **Quick status** - See all slots, branches, and uncommitted changes at a glance
 - **Smart branch handling** - Creates new branches if they don't exist, tracks remotes automatically
 - **Configurable `open` command** - Launch your editor/terminal/tmux setup with one command
-- **Auto-copies dotfiles** - Untracked files (`.envrc`, `.gitignore/`, etc.) copied to new slots
+- **Auto-copies dotfiles** - Untracked files (`.envrc`, etc.) copied to new slots
 - **Safe cleanup** - Warns about uncommitted changes before removing slots
 - **XDG-compliant config** - Settings in `~/.config/worktree-slots/config`
 - **Zero dependencies** - Just bash and git
