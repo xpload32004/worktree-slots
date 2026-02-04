@@ -1,5 +1,9 @@
 # worktree-slots
 
+<p align="center">
+  <img src="worktree-slots.png" alt="worktree-slots logo" width="400">
+</p>
+
 A simple CLI to manage git worktrees as numbered "slots" for parallel development.
 
 ## The Problem
