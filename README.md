@@ -61,7 +61,7 @@ No more thinking about directory names or paths. Just "slot 1", "slot 2", etc.
 - **Quick status** - See all slots, branches, and uncommitted changes at a glance
 - **Smart branch handling** - Creates new branches if they don't exist, tracks remotes automatically
 - **Configurable `open` command** - Launch your editor/terminal/tmux setup with one command
-- **Auto-copies dotfiles** - Untracked files (`.envrc`, `.claude/`, etc.) copied to new slots
+- **Auto-copies dotfiles** - Untracked files (`.envrc`, `.gitignore/`, etc.) copied to new slots
 - **Safe cleanup** - Warns about uncommitted changes before removing slots
 - **XDG-compliant config** - Settings in `~/.config/worktree-slots/config`
 - **Zero dependencies** - Just bash and git
@@ -195,24 +195,20 @@ Override config settings:
 # Morning: Start feature work
 cd ~/repos/backend
 worktree-slots use 1 feature/user-preferences
-cd ~/repos/backend-slot-1
-code .  # Open VS Code
+worktree-slots open 1  # Opens your configured editor/terminal
 
 # Teammate asks for PR review
 worktree-slots use 2 teammate/api-refactor
-cd ~/repos/backend-slot-2
-code .  # Another VS Code window
+worktree-slots open 2  # Opens in a new window - slot 1 untouched
 
 # Urgent bug reported
 worktree-slots use 3 hotfix/login-crash
-cd ~/repos/backend-slot-3
-# Fix, commit, push, PR merged
+worktree-slots open 3  # Fix, commit, push, PR merged
 
 # Clean up hotfix slot
 worktree-slots free 3
 
-# Back to feature work - nothing changed in slot 1
-cd ~/repos/backend-slot-1
+# Back to feature work - slot 1 window is still open, nothing changed
 ```
 
 ## Requirements
